@@ -1,0 +1,14 @@
+{
+  "name": "washassist-serverless",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "pino": "^9.7.0",
+    "puppeteer-core": "^10.4.0",
+    "chrome-aws-lambda": "^10.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
