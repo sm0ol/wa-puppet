@@ -141,8 +141,22 @@ const washAssistService = {
         waitUntil: 'networkidle2' 
       });
       
+      logger.info({ phase: 'submit_login' }, 'Submitting login form');
       await page.click('.submit-login');
-      await navigationPromise;
+      
+      try {
+        await navigationPromise;
+        logger.info({ phase: 'navigation_complete' }, 'Navigation completed after login');
+      } catch (navError) {
+        logger.warn({ 
+          phase: 'navigation_warning', 
+          error: navError.message,
+          currentUrl: await page.url()
+        }, 'Navigation promise failed, but continuing');
+      }
+      
+      // Give a moment for any async operations after navigation
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
       logger.info({ phase: 'check_2fa' }, 'Checking 2FA status');
       const twofa = await page.evaluate(async () => {
@@ -162,10 +176,78 @@ const washAssistService = {
         throw new Error('2FA enabled – abort / ask user to disable');
       }
       
+      // Debug page state before harvesting cookies
+      logger.info({ phase: 'debug_page_state' }, 'Debugging page state');
+      const pageInfo = await page.evaluate(() => ({
+        url: window.location.href,
+        title: document.title,
+        hasLoginForm: !!document.querySelector('#idLogin'),
+        hasErrorMessages: !!document.querySelector('.error, .alert-danger, .validation-summary-errors'),
+        bodyText: document.body.innerText.substring(0, 500), // First 500 chars
+        readyState: document.readyState
+      }));
+      
+      logger.info({ phase: 'page_info', pageInfo }, 'Current page state');
+      
+      // Take screenshot for debugging
+      try {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const screenshotPath = `/tmp/washassist-debug-${timestamp}.png`;
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        logger.info({ phase: 'screenshot', path: screenshotPath }, 'Screenshot saved');
+      } catch (screenshotError) {
+        logger.warn({ error: screenshotError.message }, 'Failed to take screenshot');
+      }
+      
       logger.info({ phase: 'harvest_cookies' }, 'Harvesting cookies');
       const cookiePick = ["ASP.NET_SessionId", ".micrologicAUTH", "r_ssoCookie"];
-      const rawCookies = await page.cookies();
-      const filteredCookies = rawCookies.filter(c => cookiePick.includes(c.name));
+      
+      // Retry mechanism to wait for all required cookies
+      let filteredCookies = [];
+      const maxRetries = 20; // ~10 seconds with 500ms intervals
+      const retryInterval = 500;
+      
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const rawCookies = await page.cookies();
+        
+        // Log all raw cookies for debugging
+        logger.info({ 
+          phase: 'raw_cookies', 
+          attempt: attempt + 1,
+          totalCookies: rawCookies.length,
+          allCookieNames: rawCookies.map(c => c.name),
+          rawCookies: rawCookies.map(c => ({ name: c.name, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure }))
+        }, 'All cookies found on page');
+        
+        filteredCookies = rawCookies.filter(c => cookiePick.includes(c.name));
+        
+        // Check if we have all required cookies
+        const foundCookieNames = filteredCookies.map(c => c.name);
+        const missingCookies = cookiePick.filter(name => !foundCookieNames.includes(name));
+        
+        if (missingCookies.length === 0) {
+          logger.info({ 
+            phase: 'harvest_cookies', 
+            attempt: attempt + 1,
+            cookiesFound: foundCookieNames 
+          }, 'All required cookies found');
+          break;
+        }
+        
+        logger.info({ 
+          phase: 'harvest_cookies', 
+          attempt: attempt + 1,
+          missingCookies,
+          foundCookies: foundCookieNames
+        }, 'Waiting for missing cookies');
+        
+        if (attempt === maxRetries - 1) {
+          throw new Error(`Missing required cookies after ${maxRetries * retryInterval}ms: ${missingCookies.join(', ')}`);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, retryInterval));
+      }
+      
       const cookieJar = filteredCookies.map(c => `${c.name}=${c.value}`).join('; ');
       
       const expires = new Date(Date.now() + 25 * 60 * 1000).toISOString();
@@ -218,6 +300,10 @@ fastify.post('/session', async (request, reply) => {
     
     if (error.message.includes('Captcha timeout')) {
       return reply.code(428).send({ error: 'Captcha solver timed out' });
+    }
+    
+    if (error.message.includes('Missing required cookies')) {
+      return reply.code(500).send({ error: 'Authentication cookies not received - login may have failed' });
     }
     
     if (error.message.includes('credentials') || error.message.includes('401')) {
