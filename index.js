@@ -238,88 +238,204 @@ const washAssistService = {
       const captchaElapsed = Date.now() - captchaStartTime;
       logger.info({ phase: 'captcha_solved', elapsed: captchaElapsed }, 'Captcha solved');
       
-      // Inject token using proper reCAPTCHA method
-      logger.info({ phase: 'inject_token' }, 'Injecting captcha token');
+      // Inject token and trigger reCAPTCHA visual update
+      logger.info({ phase: 'inject_token' }, 'Injecting captcha token and triggering visual update');
       const tokenInjected = await page.evaluate(token => {
         try {
-          // Method 1: Set textarea value
+          // Set the g-recaptcha-response textarea (standard reCAPTCHA field)
           const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
           if (textarea) {
             textarea.value = token;
-            textarea.style.display = 'block'; // Make visible for validation
+            textarea.style.display = 'block';
           }
           
-          // Method 2: Try to trigger reCAPTCHA callback if available
-          if (window.grecaptcha && window.grecaptcha.execute) {
-            // Some implementations use a callback
-            const captchaContainer = document.querySelector('.g-recaptcha');
-            if (captchaContainer) {
-              const callback = captchaContainer.getAttribute('data-callback');
-              if (callback && window[callback]) {
-                window[callback](token);
+          // Set the CaptchaToken hidden field (ASP.NET specific)
+          const captchaTokenField = document.querySelector('#CaptchaToken');
+          if (captchaTokenField) {
+            captchaTokenField.value = token;
+          }
+          
+          // Get the reCAPTCHA widget ID and trigger callback
+          const captchaContainer = document.querySelector('.g-recaptcha, #desktop-captcha');
+          let callbackTriggered = false;
+          
+          if (captchaContainer) {
+            // Method 1: Try to find and call the callback function
+            const callback = captchaContainer.getAttribute('data-callback');
+            if (callback && window[callback]) {
+              window[callback](token);
+              callbackTriggered = true;
+            }
+            
+            // Method 2: Try to use grecaptcha.execute if available
+            if (window.grecaptcha && !callbackTriggered) {
+              try {
+                // Look for widget ID in the iframe or container
+                const iframe = captchaContainer.querySelector('iframe');
+                if (iframe) {
+                  // Extract widget ID from iframe name if possible
+                  const iframeName = iframe.getAttribute('name');
+                  if (iframeName && window.grecaptcha.getResponse) {
+                    // Try to trigger the success callback manually
+                    const widgetId = captchaContainer.getAttribute('data-widget-id') || 0;
+                    if (window.grecaptcha.execute) {
+                      window.grecaptcha.execute(widgetId);
+                      callbackTriggered = true;
+                    }
+                  }
+                }
+              } catch (e) {
+                console.log('grecaptcha.execute failed:', e);
+              }
+            }
+            
+            // Method 3: Try to simulate a successful reCAPTCHA by updating the visual state
+            if (!callbackTriggered) {
+              try {
+                // Add the visual "success" class to the container
+                captchaContainer.classList.add('recaptcha-success');
+                
+                // Look for the checkbox and mark it as checked
+                const checkbox = captchaContainer.querySelector('.recaptcha-checkbox');
+                if (checkbox) {
+                  checkbox.classList.add('recaptcha-checkbox-checked');
+                }
+                
+                // Dispatch a custom event to simulate completion
+                const event = new CustomEvent('recaptcha-success', { 
+                  detail: { token: token },
+                  bubbles: true 
+                });
+                captchaContainer.dispatchEvent(event);
+                callbackTriggered = true;
+              } catch (e) {
+                console.log('Visual state update failed:', e);
               }
             }
           }
           
-          // Method 3: Dispatch change event to notify form validation
+          // Dispatch change events on form fields
           if (textarea) {
             textarea.dispatchEvent(new Event('change', { bubbles: true }));
             textarea.dispatchEvent(new Event('input', { bubbles: true }));
           }
           
-          return !!textarea;
+          if (captchaTokenField) {
+            captchaTokenField.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          
+          return {
+            hasTextarea: !!textarea,
+            hasCaptchaField: !!captchaTokenField,
+            callbackTriggered: callbackTriggered,
+            containerFound: !!captchaContainer
+          };
         } catch (e) {
           console.error('Token injection error:', e);
-          return false;
+          return { error: e.message };
         }
       }, token);
       
-      if (!tokenInjected) {
-        throw new Error('Failed to inject captcha token into page');
+      if (tokenInjected.error) {
+        throw new Error(`Failed to inject captcha token: ${tokenInjected.error}`);
       }
       
-      // Wait a moment for any validation to complete
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (!tokenInjected.hasTextarea || !tokenInjected.hasCaptchaField) {
+        throw new Error('Failed to find required captcha fields on page');
+      }
       
-      // Verify captcha appears to be accepted
+      logger.info({ 
+        phase: 'token_injection_result', 
+        ...tokenInjected 
+      }, 'Token injection completed');
+      
+      // Wait a moment for any visual updates to complete
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Verify captcha token is properly set
       const captchaStatus = await page.evaluate(() => {
         const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
-        const captchaContainer = document.querySelector('.g-recaptcha');
+        const captchaTokenField = document.querySelector('#CaptchaToken');
+        const captchaContainer = document.querySelector('.g-recaptcha, #desktop-captcha');
+        
         return {
           hasToken: textarea?.value?.length > 0,
           tokenLength: textarea?.value?.length || 0,
+          captchaFieldSet: captchaTokenField?.value?.length > 0,
           containerClasses: captchaContainer?.className || '',
-          isVisible: textarea ? getComputedStyle(textarea).display !== 'none' : false
+          isVisible: textarea ? getComputedStyle(textarea).display !== 'none' : false,
+          containerHTML: captchaContainer?.outerHTML?.substring(0, 200) || ''
         };
       });
       
-      logger.info({ phase: 'captcha_status', ...captchaStatus }, 'Captcha injection status');
+      logger.info({ phase: 'captcha_status', ...captchaStatus }, 'Final captcha status check');
       
-      if (!captchaStatus.hasToken) {
-        throw new Error('Captcha token was not properly set in the form');
+      if (!captchaStatus.hasToken || !captchaStatus.captchaFieldSet) {
+        throw new Error('Captcha token was not properly set in both required fields');
       }
       
-      const navigationPromise = page.waitForNavigation({ 
-        timeout: 15000, 
-        waitUntil: 'networkidle2' 
-      });
+      // Submit the login form via POST request (this is what actually happens in the browser)
+      logger.info({ phase: 'submit_login' }, 'Submitting login via POST request');
       
-      logger.info({ phase: 'submit_login' }, 'Submitting login form');
-      await page.click('.submit-login');
+      const loginResponse = await page.evaluate(async (user, pass, code, token) => {
+        try {
+          // Create form data exactly like the browser does
+          const formData = new URLSearchParams();
+          formData.append('TimeZoneOffset', '-360');
+          formData.append('CaptchaToken', token);
+          formData.append('UserName', user);
+          formData.append('Password', pass);
+          formData.append('CustomerCode', code);
+          formData.append('OTPTOken', '');
+          formData.append('bOTPTOken', '');
+          formData.append('bResendOTPTOken', 'false');
+          formData.append('g-recaptcha-response', token);
+          
+          const response = await fetch('/Home/Login', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+              'Cache-Control': 'max-age=0',
+              'Origin': 'https://lb.washassist.com',
+              'Referer': 'https://lb.washassist.com/',
+              'Sec-Fetch-Dest': 'document',
+              'Sec-Fetch-Mode': 'navigate',
+              'Sec-Fetch-Site': 'same-origin',
+              'Sec-Fetch-User': '?1',
+              'Upgrade-Insecure-Requests': '1'
+            },
+            body: formData.toString()
+          });
+          
+          return {
+            status: response.status,
+            ok: response.ok,
+            url: response.url,
+            redirected: response.redirected
+          };
+        } catch (error) {
+          return {
+            error: error.message
+          };
+        }
+      }, user, pass, code, token);
       
-      try {
-        await navigationPromise;
-        logger.info({ phase: 'navigation_complete' }, 'Navigation completed after login');
-      } catch (navError) {
-        logger.warn({ 
-          phase: 'navigation_warning', 
-          error: navError.message,
-          currentUrl: await page.url()
-        }, 'Navigation promise failed, but continuing');
+      logger.info({ 
+        phase: 'login_response', 
+        response: loginResponse 
+      }, 'Login POST response received');
+      
+      if (loginResponse.error) {
+        throw new Error(`Login request failed: ${loginResponse.error}`);
       }
       
-      // Give a moment for any async operations after navigation
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      if (!loginResponse.ok) {
+        throw new Error(`Login failed with status ${loginResponse.status}`);
+      }
+      
+      // Wait a moment for cookies to be set after successful login
+      await new Promise(resolve => setTimeout(resolve, 3000));
       
       logger.info({ phase: 'check_2fa' }, 'Checking 2FA status');
       const twofa = await page.evaluate(async () => {
@@ -371,18 +487,37 @@ const washAssistService = {
       const retryInterval = 500;
       
       for (let attempt = 0; attempt < maxRetries; attempt++) {
+        // Get all cookies from current page/domain
         const rawCookies = await page.cookies();
         
-        // Log all raw cookies for debugging
+        // Also try to get cookies from common WashAssist domains
+        let additionalCookies = [];
+        try {
+          const washAssistCookies = await page.cookies('https://washassist.com');
+          const lbWashAssistCookies = await page.cookies('https://lb.washassist.com');
+          additionalCookies = [...washAssistCookies, ...lbWashAssistCookies];
+        } catch (e) {
+          logger.debug({ error: e.message }, 'Could not fetch cookies from additional domains');
+        }
+        
+        const allCookies = [...rawCookies, ...additionalCookies];
+        
+        // Remove duplicates based on name and domain
+        const uniqueCookies = allCookies.filter((cookie, index, arr) => 
+          arr.findIndex(c => c.name === cookie.name && c.domain === cookie.domain) === index
+        );
+        
+        // Log all cookies for debugging
         logger.info({ 
           phase: 'raw_cookies', 
           attempt: attempt + 1,
-          totalCookies: rawCookies.length,
-          allCookieNames: rawCookies.map(c => c.name),
-          rawCookies: rawCookies.map(c => ({ name: c.name, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure }))
-        }, 'All cookies found on page');
+          currentUrl: await page.url(),
+          totalCookies: uniqueCookies.length,
+          allCookieNames: uniqueCookies.map(c => c.name),
+          rawCookies: uniqueCookies.map(c => ({ name: c.name, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure }))
+        }, 'All cookies found after login');
         
-        filteredCookies = rawCookies.filter(c => cookiePick.includes(c.name));
+        filteredCookies = uniqueCookies.filter(c => cookiePick.includes(c.name));
         
         // Check if we have all required cookies
         const foundCookieNames = filteredCookies.map(c => c.name);
