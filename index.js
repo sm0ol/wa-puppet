@@ -468,14 +468,18 @@ const washAssistService = {
       
       logger.info({ phase: 'page_info', pageInfo }, 'Current page state');
       
-      // Take screenshot for debugging
-      try {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const screenshotPath = `/tmp/washassist-debug-${timestamp}.png`;
-        await page.screenshot({ path: screenshotPath, fullPage: true });
-        logger.info({ phase: 'screenshot', path: screenshotPath }, 'Screenshot saved');
-      } catch (screenshotError) {
-        logger.warn({ error: screenshotError.message }, 'Failed to take screenshot');
+      // Take screenshot for debugging (only if DUMP_SCREENSHOTS env var is set)
+      if (process.env.DUMP_SCREENSHOTS === 'true') {
+        try {
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const screenshotPath = `/tmp/washassist-debug-${timestamp}.png`;
+          await page.screenshot({ path: screenshotPath, fullPage: true });
+          logger.info({ phase: 'screenshot', path: screenshotPath }, 'Screenshot saved');
+        } catch (screenshotError) {
+          logger.warn({ error: screenshotError.message }, 'Failed to take screenshot');
+        }
+      } else {
+        logger.debug({ phase: 'screenshot_skipped' }, 'Screenshot disabled (DUMP_SCREENSHOTS not set)');
       }
       
       logger.info({ phase: 'harvest_cookies' }, 'Harvesting cookies');
