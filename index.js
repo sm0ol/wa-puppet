@@ -133,7 +133,64 @@ const browserService = {
   }
 };
 
+const webhookService = {
+  async callWebhook(webhookUrl, payload) {
+    try {
+      process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0;
+      logger.info({ webhookUrl, requestId: payload.request_id }, 'Calling webhook');
+      
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload)
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Webhook call failed with status ${response.status}`);
+      }
+      
+      logger.info({ webhookUrl, requestId: payload.request_id, status: response.status }, 'Webhook called successfully');
+    } catch (error) {
+      logger.error({ 
+        webhookUrl, 
+        requestId: payload.request_id, 
+        error: error.message 
+      }, 'Webhook call failed');
+      // Note: We don't throw here to avoid crashing the async process
+    }
+  }
+};
+
 const washAssistService = {
+  async processAuthAsync(requestId, webhookUrl, user, pass, code) {
+    logger.info({ requestId, phase: 'async_start' }, 'Starting async authentication');
+    
+    try {
+      const result = await this.login(user, pass, code);
+      
+      // Call success webhook
+      await webhookService.callWebhook(webhookUrl, {
+        request_id: requestId,
+        success: true,
+        cookies: result.cookies,
+        expires: result.expires
+      });
+      
+      logger.info({ requestId, phase: 'async_complete' }, 'Async authentication completed successfully');
+    } catch (error) {
+      logger.error({ requestId, phase: 'async_error', error: error.message }, 'Async authentication failed');
+      
+      // Call failure webhook
+      await webhookService.callWebhook(webhookUrl, {
+        request_id: requestId,
+        success: false,
+        error: `Authentication failed: ${error.message}`
+      });
+    }
+  },
+
   async login(user, pass, code) {
     const startTime = Date.now();
     logger.info({ phase: 'start', user }, 'Starting login process');
@@ -385,6 +442,42 @@ const washAssistService = {
     }
   }
 };
+
+fastify.post('/session-async', async (request, reply) => {
+  try {
+    const { request_id, webhook_url, user, pass, code } = request.body;
+    
+    if (!request_id || !webhook_url || !user || !pass || !code) {
+      return reply.code(400).send({ 
+        error: 'Missing required fields: request_id, webhook_url, user, pass, code' 
+      });
+    }
+    
+    // Validate webhook URL format
+    try {
+      new URL(webhook_url);
+    } catch {
+      return reply.code(400).send({ 
+        error: 'Invalid webhook_url format' 
+      });
+    }
+    
+    // Start async processing without waiting
+    setImmediate(() => {
+      washAssistService.processAuthAsync(request_id, webhook_url, user, pass, code);
+    });
+    
+    return reply.code(202).send({
+      success: true,
+      message: 'Authentication request queued',
+      request_id
+    });
+    
+  } catch (error) {
+    logger.error({ error: error.message }, 'Session-async endpoint error');
+    return reply.code(500).send({ error: 'Internal server error' });
+  }
+});
 
 fastify.post('/session', async (request, reply) => {
   try {
