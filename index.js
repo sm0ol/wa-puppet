@@ -42,8 +42,18 @@ const antiCaptchaService = {
   },
 
   async getTaskResult(taskId) {
-    for (let i = 0; i < 15; i++) {
-      await new Promise(resolve => setTimeout(resolve, 4000));
+    const maxAttempts = 20; // Increased attempts
+    const interval = 3000; // Reduced interval to 3 seconds
+    const startTime = Date.now();
+    const maxWaitTime = 90000; // 90 seconds max wait to stay under 2-minute token validity
+    
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(resolve => setTimeout(resolve, interval));
+      
+      const elapsed = Date.now() - startTime;
+      if (elapsed > maxWaitTime) {
+        throw new Error(`Captcha timeout after ${elapsed}ms - token would expire`);
+      }
       
       const response = await fetch('https://api.anti-captcha.com/getTaskResult', {
         method: 'POST',
@@ -55,11 +65,27 @@ const antiCaptchaService = {
       });
       
       const result = await response.json();
+      
+      if (result.errorId !== 0) {
+        throw new Error(`Anti-captcha get result error: ${result.errorDescription}`);
+      }
+      
       if (result.status === 'ready') {
+        logger.info({ elapsed, attempts: i + 1 }, 'Captcha solved successfully');
         return result.solution.gRecaptchaResponse;
       }
+      
+      if (result.status === 'processing') {
+        logger.debug({ attempt: i + 1, elapsed }, 'Captcha still processing');
+        continue;
+      }
+      
+      // Handle other statuses
+      throw new Error(`Unexpected captcha status: ${result.status}`);
     }
-    throw new Error('Captcha timeout');
+    
+    const elapsed = Date.now() - startTime;
+    throw new Error(`Captcha timeout after ${maxAttempts} attempts (${elapsed}ms)`);
   }
 };
 
@@ -121,20 +147,100 @@ const washAssistService = {
       await page.goto('https://lb.washassist.com/', { waitUntil: 'domcontentloaded' });
       
       logger.info({ phase: 'extract_sitekey' }, 'Extracting reCAPTCHA sitekey');
-      const sitekey = await page.$eval('#desktop-captcha', el => el.dataset.sitekey);
       
-      logger.info({ phase: 'solve_captcha' }, 'Solving captcha');
+      // Try multiple selectors for the captcha element
+      let sitekey;
+      const captchaSelectors = ['#desktop-captcha', '.g-recaptcha', '[data-sitekey]'];
+      for (const selector of captchaSelectors) {
+        try {
+          sitekey = await page.$eval(selector, el => el.dataset.sitekey || el.getAttribute('data-sitekey'));
+          if (sitekey) break;
+        } catch (e) {
+          logger.debug({ selector, error: e.message }, 'Captcha selector not found');
+        }
+      }
+      
+      if (!sitekey) {
+        throw new Error('Could not extract reCAPTCHA sitekey from page');
+      }
+      
+      logger.info({ sitekey }, 'Found reCAPTCHA sitekey');
+      
+      // Start captcha solving and form filling in parallel to save time
+      logger.info({ phase: 'solve_captcha' }, 'Starting captcha solve');
+      const captchaStartTime = Date.now();
       const taskId = await antiCaptchaService.createTask(sitekey);
-      const token = await antiCaptchaService.getTaskResult(taskId);
       
-      logger.info({ phase: 'fill_form' }, 'Filling login form');
+      logger.info({ phase: 'fill_form' }, 'Filling login form while captcha solves');
       await page.type('#idLogin', user);
       await page.type('#idPassword', pass);
       await page.type('#idCustomerCode', code);
       
-      await page.evaluate(token => {
-        document.querySelector('textarea[name="g-recaptcha-response"]').value = token;
+      // Get captcha token
+      const token = await antiCaptchaService.getTaskResult(taskId);
+      const captchaElapsed = Date.now() - captchaStartTime;
+      logger.info({ phase: 'captcha_solved', elapsed: captchaElapsed }, 'Captcha solved');
+      
+      // Inject token using proper reCAPTCHA method
+      logger.info({ phase: 'inject_token' }, 'Injecting captcha token');
+      const tokenInjected = await page.evaluate(token => {
+        try {
+          // Method 1: Set textarea value
+          const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
+          if (textarea) {
+            textarea.value = token;
+            textarea.style.display = 'block'; // Make visible for validation
+          }
+          
+          // Method 2: Try to trigger reCAPTCHA callback if available
+          if (window.grecaptcha && window.grecaptcha.execute) {
+            // Some implementations use a callback
+            const captchaContainer = document.querySelector('.g-recaptcha');
+            if (captchaContainer) {
+              const callback = captchaContainer.getAttribute('data-callback');
+              if (callback && window[callback]) {
+                window[callback](token);
+              }
+            }
+          }
+          
+          // Method 3: Dispatch change event to notify form validation
+          if (textarea) {
+            textarea.dispatchEvent(new Event('change', { bubbles: true }));
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          
+          return !!textarea;
+        } catch (e) {
+          console.error('Token injection error:', e);
+          return false;
+        }
       }, token);
+      
+      if (!tokenInjected) {
+        throw new Error('Failed to inject captcha token into page');
+      }
+      
+      // Wait a moment for any validation to complete
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Verify captcha appears to be accepted
+      const captchaStatus = await page.evaluate(() => {
+        const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
+        const captchaContainer = document.querySelector('.g-recaptcha');
+        return {
+          hasToken: textarea?.value?.length > 0,
+          tokenLength: textarea?.value?.length || 0,
+          containerClasses: captchaContainer?.className || '',
+          isVisible: textarea ? getComputedStyle(textarea).display !== 'none' : false
+        };
+      });
+      
+      logger.info({ phase: 'captcha_status', ...captchaStatus }, 'Captcha injection status');
+      
+      if (!captchaStatus.hasToken) {
+        throw new Error('Captcha token was not properly set in the form');
+      }
       
       const navigationPromise = page.waitForNavigation({ 
         timeout: 15000, 
