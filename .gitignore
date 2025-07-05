@@ -2,3 +2,6 @@
 .env
 *.md
 node_modules
+webhook-test.js
+.DS_Store
+tmp-screens*
